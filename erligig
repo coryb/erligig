@@ -1,0 +1,27 @@
+#!/usr/bin/env escript
+
+-define(REQ,<<"\0REQ">>).
+-define(RES,<<"\0RES">>).
+-define(CAN_DO, 1).
+
+main(_) ->
+    {ok, ListenSocket} = gen_tcp:listen(8888, [{active,once}, binary]),
+    spawn(fun() -> acceptor(ListenSocket) end),
+    timer:sleep(infinity).
+
+acceptor(ListenSocket) ->
+    {ok, Socket} = gen_tcp:accept(ListenSocket),
+    spawn(fun() -> acceptor(ListenSocket) end),
+    handle(Socket).
+
+handle(Socket) ->
+    inet:setopts(Socket, [{active, once}]),
+    receive
+        {tcp, Socket, <<Req:4/binary, Type:32, Length:32, Data:Length/binary>>} ->
+            handle_message(Socket, Req, Type, Data)
+    end.
+
+handle_message(Socket,?REQ, ?CAN_DO, Data)->
+    io:format("worker register: ~p~n",[Data]),
+    handle(Socket).
+
