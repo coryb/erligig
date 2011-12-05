@@ -87,20 +87,11 @@ handle_message(Worker,?REQ,?CANT_DO,Data) ->
 % this is a SYNC job, it will not be inserted into the queue
 handle_message(Client, ?REQ, ?SUBMIT_JOB, Data)->
     io:format("==> client: ~p SUBMIT_JOB~n", [Client]),
-    Job = mkjob(Client,Data),
-    mnesia:transaction(fun() -> mnesia:write(Job) end),
-    io:format("<== client: ~p JOB_CREATED~n", [Client]),
-    send_response(Client,?JOB_CREATED,Job#work.id),
-    Worker = find_worker(Job),
-    io:format("<== worker: ~p NOOP~n", [Worker]),
-    send_response(Worker,?NOOP,<<>>);
+    submit_job(Client,Client,Data);
 
 handle_message(Client, ?REQ, ?SUBMIT_JOB_BG, Data) ->
-    io:format("==> client: ~p SUBMIT_JOB~n", [Client]),
-    Job = mkjob(Client,Data),
-    mnesia:transaction(fun() -> mnesia:write(Job) end),
-    io:format("<== client: ~p JOB_CREATED~n", [Client]),
-    send_response(Client, ?JOB_CREATED, Job#work.id);
+    io:format("==> client: ~p SUBMIT_JOB_BG~n", [Client]),
+    submit_job(Client,null,Data);
 
 handle_message(Worker,?REQ, ?GRAB_JOB,_Data)->
     io:format("==> worker: ~p GRAB_JOB~n", [Worker]),
@@ -141,8 +132,11 @@ handle_message(Worker,?REQ, ?WORK_COMPLETE, Data) ->
                               J#work.id =:= ID])),
     mnesia:transaction(fun() -> mnesia:delete({work,Job#work.id}) end),
 
-    io:format("<== client: ~p WORK_COMPLETE~n", [Job#work.client]),
-    send_response(Job#work.client, ?WORK_COMPLETE, Data);
+    if Job#work.client =/= null ->
+            io:format("<== client: ~p WORK_COMPLETE~n", [Job#work.client]),
+            send_response(Job#work.client, ?WORK_COMPLETE, Data);
+       true -> noop
+    end;
 
 % this ones goes last to alert us something didnt get handled properly
 handle_message(_Socket, Req, Type, Data) ->
@@ -152,6 +146,21 @@ send_response(Socket, Type, Data) ->
     Len=byte_size(Data),
     gen_tcp:send(Socket, [?RES, <<Type:32, Len:32>>, Data]).
 
+submit_job(Client, RespondTo, Data) ->
+    Job = mkjob(RespondTo,Data),
+    mnesia:transaction(fun() -> mnesia:write(Job) end),
+    io:format("<== client: ~p JOB_CREATED~n", [Client]),
+    send_response(Client,?JOB_CREATED,Job#work.id),
+    spawn( fun() -> wakeup_worker(Job) end ).
+
+wakeup_worker(Job) ->
+    Worker = find_worker(Job),
+    if Worker =/= null ->
+            io:format("<== worker: ~p NOOP~n", [Worker]),
+            send_response(Worker,?NOOP,<<>>);
+       true -> noop
+    end.
+    
 find_worker(Job) ->
     Workers = dbq(qlc:q([W#worker.sock || W <- mnesia:table(worker),
                                           W#worker.state =:= ready,
