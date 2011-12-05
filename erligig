@@ -2,6 +2,8 @@
 %% -*- mode: erlang -*-
 -include_lib("stdlib/include/qlc.hrl").
 
+-mode(compile). %force compilation before executing
+
 -define(REQ,<<"\0REQ">>).
 -define(RES,<<"\0RES">>).
 -define(CAN_DO, 1).
