@@ -1,11 +1,44 @@
 #!/usr/bin/env escript
+%% -*- mode: erlang -*-
+-include_lib("stdlib/include/qlc.hrl").
 
 -define(REQ,<<"\0REQ">>).
 -define(RES,<<"\0RES">>).
 -define(CAN_DO, 1).
+-define(CANT_DO,2).
+-define(RESET_ABILITIES,3).
+-define(PRE_SLEEP,4).
+-define(NOOP,6).
+-define(SUBMIT_JOB, 7).
+-define(JOB_CREATED, 8).  %response from SUBMIT_JOB*
+-define(GRAB_JOB,9).
+-define(NO_JOB,10). %response from GRAB_JOB on empty queue
+-define(WORK_ASSIGN,11). %response from GRAB_JOB with work
+
+% create record types for out DB's
+%---------------------------------
+% worker record just marks if a worker socket is busy
+-record(worker, {sock,state=ready}).
+% function record maps the available functions onto the worker sockets
+-record(function, {name,sock}).
+
+-record(work, {id,name,data}).
 
 main(_) ->
-    {ok, ListenSocket} = gen_tcp:listen(8888, [{active,once}, binary]),
+    % start up mnesia DB
+    ok = application:start(mnesia),
+    % create our tables, in memory only on local node
+    {atomic,ok} = mnesia:create_table(worker, [{ram_copies,[node()]},{type,set},{attributes,record_info(fields,worker)}]),
+    {atomic,ok} = mnesia:create_table(function, [{ram_copies,[node()]},{type,bag},{attributes,record_info(fields,function)}]),
+
+    % create our memory + disk tables:
+    {atomic,ok} = mnesia:create_table(work, [{ram_copies,[node()]},{type,bag},{attributes,record_info(fields,work)}]),
+
+    % make sure tables are created before we continue
+    ok = mnesia:wait_for_tables([worker,function],infinity),
+    
+    % bind to our listn port then start acceptint connections
+    {ok, ListenSocket} = gen_tcp:listen(8888, [{active,once}, binary, {reuseaddr, true}]),
     spawn(fun() -> acceptor(ListenSocket) end),
     timer:sleep(infinity).
 
@@ -14,14 +47,68 @@ acceptor(ListenSocket) ->
     spawn(fun() -> acceptor(ListenSocket) end),
     handle(Socket).
 
+dbq(QLC)->
+    {atomic, Result} = mnesia:transaction(fun() -> qlc:e(QLC) end),
+    Result.
+
 handle(Socket) ->
     inet:setopts(Socket, [{active, once}]),
     receive
-        {tcp, Socket, <<Req:4/binary, Type:32, Length:32, Data:Length/binary>>} ->
-            handle_message(Socket, Req, Type, Data)
+        {tcp, Socket, <<"status\r\n">>} ->
+            report_status(Socket);
+        {tcp, Socket, Message} ->
+            % we might get several seperate protocol requests in one Message, so use binary comprehension to
+            % split them up and call handle_message for each
+            [ handle_message(Socket, Req, Type, Data) || <<Req:4/binary, Type:32, Length:32, Data:Length/binary>> <= Message ],
+            handle(Socket);
+        {tcp_closed, Socket} ->
+            mnesia:transaction(
+              fun() -> 
+                      dbq(qlc:q([mnesia:delete(X) || X <- mnesia:table(function), X#function.sock =:= Socket])),
+                      dbq(qlc:q([mnesia:delete(X) || X <- mnesia:table(worker), X#worker.sock =:= Socket]))
+              end
+             );
+        UnhandledMessage -> io:format("unhandled message: ~p~n", [UnhandledMessage])
     end.
 
-handle_message(Socket,?REQ, ?CAN_DO, Data)->
+handle_message(Worker,?REQ, ?CAN_DO, Data)->
     io:format("worker register: ~p~n",[Data]),
-    handle(Socket).
+    % load out new worker into the DB
+    WorkerRec = #worker{sock=Worker},
+    FuncRec = #function{name=Data,sock=Worker},
+    mnesia:transaction(fun() -> mnesia:write(WorkerRec), mnesia:write(FuncRec) end),
+    io:format("worker: ~p~n", [ dbq(qlc:q([X || X <- mnesia:table(worker)])) ]),
+    io:format("function: ~p~n", [ dbq(qlc:q([X || X <- mnesia:table(function)])) ]);
 
+handle_message(Worker,?REQ,?CANT_DO,Data)->
+    io:format("worker unregister: ~p~n",[Data]),
+    FuncRec = #function{name=Data,sock=Worker},
+    mnesia:transaction(fun() -> mnesia:delete(FuncRec) end);
+
+handle_message(Client,?REQ, ?SUBMIT_JOB,Data)->
+    %% FIXME should use binary:split here, but not available in my 
+    %% erlang version R13B03
+    [Function, ID|Work] = string:tokens(binary_to_list(Data),"\0"),
+    Job = #work{id=list_to_binary(ID),name=list_to_binary(Function),data=list_to_binary(Work)},
+    mnesia:transaction(fun() -> mnesia:write(Job) end),
+    io:format("work: ~p~n", [ dbq(qlc:q([X || X <- mnesia:table(work)])) ]);
+
+handle_message(Worker,?REQ, ?GRAB_JOB,_Data)->
+    io:format("worker: ~p GRAB_JOB~n", [Worker]),
+    gen_tcp:send(Worker,[?RES,<<0,0,0,10,0,0,0,0>>]);
+
+handle_message(Worker,?REQ, ?PRE_SLEEP,_Data)->
+    io:format("worker: ~p PRE_SLEEP~n", [Worker]),
+    WorkerRec = #worker{sock=Worker,state=asleep},
+    mnesia:transaction(fun() -> mnesia:write(WorkerRec) end),
+    io:format("worker: ~p~n", [ dbq(qlc:q([X || X <- mnesia:table(worker)])) ]);
+
+% this ones goes last to alert us something didnt get handled properly
+handle_message(_Socket, Req, Type, Data) ->
+    io:format("got unknown message req:~p type:~p data:~p~n", [Req,Type,Data]).
+
+report_status(Socket)->
+    dbq(qlc:q([ io:format("report worker: ~p~n", [X]) || X <- mnesia:table(worker) ])),
+    dbq(qlc:q([ io:format("report function: ~p~n", [X]) || X <- mnesia:table(function) ])),
+    dbq(qlc:q([ io:format("report work: ~p~n", [X]) || X <- mnesia:table(work) ])),
+    gen_tcp:send(Socket,<<"TODO\n">>).
