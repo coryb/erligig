@@ -24,7 +24,7 @@
 % function record maps the available functions onto the worker sockets
 -record(function, {sock,name}).
 
--record(work, {id,name,data,client_id,client}).
+-record(work, {id,name,data,client_id,client,assigned=null}).
 
 main(_) ->
     % start up mnesia DB
@@ -67,7 +67,17 @@ handle(Socket) ->
             mnesia:transaction(
               fun() -> 
                       dbq(qlc:q([mnesia:delete({function, X#function.sock}) || X <- mnesia:table(function), X#function.sock =:= Socket])),
-                      dbq(qlc:q([mnesia:delete({worker, X#worker.sock})     || X <- mnesia:table(worker),   X#worker.sock =:= Socket]))
+                      dbq(qlc:q([mnesia:delete({worker, X#worker.sock})     || X <- mnesia:table(worker),   X#worker.sock =:= Socket])),
+                      
+                      %% if it died while work was still running on it, then update the queue so it can be issued out again    
+                      Jobs = dbq(qlc:q([X#work{assigned=null} || X <- mnesia:table(work),   X#work.assigned =:= Socket])),
+                      [mnesia:write(X) || X <- Jobs],
+                      %% if jobs found, then kick some other worker to handle the workload
+                      %% that this one just abandoned
+                      case Jobs of
+                          [] -> ok;
+                          Jobs -> wakeup_worker(hd(Jobs))
+                      end
               end
              );
         UnhandledMessage -> io:format("unhandled message: ~p~n", [UnhandledMessage])
@@ -104,7 +114,10 @@ handle_message(Worker,?REQ, ?GRAB_JOB,_Data)->
 
             % update our state to mark the worker busy so we dont send it more work
             WorkerRec = #worker{sock=Worker,state=busy},
-            mnesia:transaction(fun() -> mnesia:write(WorkerRec) end),
+            % also update our job queue so we dont reassign the job to someone else
+            WorkRec = Work#work{assigned=Worker},
+            mnesia:transaction(fun() -> mnesia:write(WorkerRec), mnesia:write(WorkRec) end),
+
             io:format("<== worker: ~p JOB_ASSIGN~n", [Worker]),
             send_response(Worker, ?JOB_ASSIGN, Workload)
     end;
@@ -168,18 +181,19 @@ find_worker(Job) ->
                                           W#worker.sock =:= F#function.sock,
                                           F#function.name =:= Job#work.name ])),
     case Workers of
-        [Worker|_] -> Worker;
-        [] -> null
+        [] -> null;
+        Workers -> hd(Workers)
     end.
 
 find_work(Worker) ->
     Jobs = dbq(qlc:q([J || J <- mnesia:table(work),
                            F <- mnesia:table(function),
                            J#work.name =:= F#function.name,
-                           F#function.sock =:= Worker ])),
+                           F#function.sock =:= Worker,
+                           J#work.assigned =:= null])),
     case Jobs of
-        [Job|_] -> Job;
-        [] -> null
+        [] -> null;
+        Jobs -> hd(Jobs)
     end.
 
 mkjob(Client,Data) ->
