@@ -1,3 +1,5 @@
+* implement SUBMIT_JOB_EPOCH and SUBMIT_JOB_SCHED
+  note #work.schedule = {Epoch div 1000000, Epoch rem 1000000, 0}
 * create mutex for socket so multiple processes to not write
   to the same socket at the same time
   - can we verify this is a legit concern?

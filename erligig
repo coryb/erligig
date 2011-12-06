@@ -19,6 +19,8 @@
 -define(WORK_COMPLETE,13).
 -define(SUBMIT_JOB_BG,18).
 
+-define(DEBUG(Format,Args),logger ! ["DEBUG",?FILE,?LINE,Format,Args]).
+
 % create record types for out DB's
 %---------------------------------
 % worker record just marks if a worker socket is busy
@@ -26,7 +28,7 @@
 % function record maps the available functions onto the worker sockets
 -record(function, {sock,name}).
 
--record(work, {id,ctime=now(),name,data,client_id,client,assigned=null,schedule=now()}).
+-record(work, {id,ctime,name,data,client_id,client,assigned=null,schedule}).
 
 main(_) ->
     % start up mnesia DB
@@ -44,7 +46,15 @@ main(_) ->
     % bind to our listn port then start acceptint connections
     {ok, ListenSocket} = gen_tcp:listen(8888, [{active,once}, binary, {reuseaddr, true}]),
     spawn(fun() -> acceptor(ListenSocket) end),
+    register(logger, spawn(fun() -> logger_loop() end)),
     timer:sleep(infinity).
+
+logger_loop() ->
+    receive
+        [Level,File,Line,Format,Args] ->
+            io:format(string:concat("~s [~s:~.10B]: ", Format), [Level,File,Line|Args])
+    end,
+    logger_loop().
 
 acceptor(ListenSocket) ->
     {ok, Socket} = gen_tcp:accept(ListenSocket),
@@ -82,34 +92,34 @@ handle(Socket) ->
                       [wakeup_worker(Job) || Job <- Jobs]
               end
              );
-        UnhandledMessage -> io:format("unhandled message: ~p~n", [UnhandledMessage])
+        UnhandledMessage -> ?DEBUG("unhandled message: ~p~n", [UnhandledMessage])
     end.
 
 handle_message(Worker,?REQ, ?CAN_DO, Data)->
-    io:format("==> worker register: ~p~n",[Data]),
+    ?DEBUG("==> worker register: ~p~n",[Data]),
     % load out new worker into the DB
     WorkerRec = #worker{sock=Worker},
     FuncRec = #function{name=Data,sock=Worker},
     mnesia:transaction(fun() -> mnesia:write(WorkerRec), mnesia:write(FuncRec) end);
 
 handle_message(Worker,?REQ,?CANT_DO,Data) ->
-    io:format("==> worker unregister: ~p~n",[Data]),
+    ?DEBUG("==> worker unregister: ~p~n",[Data]),
     mnesia:transaction(fun() -> mnesia:delete({function,Worker}) end);
 
 % this is a SYNC job, it will not be inserted into the queue
 handle_message(Client, ?REQ, ?SUBMIT_JOB, Data)->
-    io:format("==> client: ~p SUBMIT_JOB~n", [Client]),
+    ?DEBUG("==> client: ~p SUBMIT_JOB~n", [Client]),
     submit_job(Client,Client,Data);
 
 handle_message(Client, ?REQ, ?SUBMIT_JOB_BG, Data) ->
-    io:format("==> client: ~p SUBMIT_JOB_BG~n", [Client]),
+    ?DEBUG("==> client: ~p SUBMIT_JOB_BG~n", [Client]),
     submit_job(Client,null,Data);
 
 handle_message(Worker,?REQ, ?GRAB_JOB,_Data)->
-    io:format("==> worker: ~p GRAB_JOB~n", [Worker]),
+    ?DEBUG("==> worker: ~p GRAB_JOB~n", [Worker]),
     Work = find_work(Worker),
     if Work =:= null ->       
-            io:format("<== worker: ~p NO_JOB~n", [Worker]),
+            ?DEBUG("<== worker: ~p NO_JOB~n", [Worker]),
             send_response(Worker,?NO_JOB,<<>>);
        true ->
             Workload = list_to_binary([Work#work.id,0,Work#work.name,0,Work#work.data]),
@@ -120,19 +130,19 @@ handle_message(Worker,?REQ, ?GRAB_JOB,_Data)->
             WorkRec = Work#work{assigned=Worker},
             mnesia:transaction(fun() -> mnesia:write(WorkerRec), mnesia:write(WorkRec) end),
 
-            io:format("<== worker: ~p JOB_ASSIGN~n", [Worker]),
+            ?DEBUG("<== worker: ~p JOB_ASSIGN~n", [Worker]),
             send_response(Worker, ?JOB_ASSIGN, Workload)
     end;
 
 handle_message(Worker,?REQ, ?PRE_SLEEP,_Data)->
-    io:format("==> worker: ~p PRE_SLEEP~n", [Worker])
+    ?DEBUG("==> worker: ~p PRE_SLEEP~n", [Worker])
     %% do we need to update worker.state to "asleep" or
     %% do we just send NOOP RES to workers anytime
     %% we want them to do work?
     ;
 
 handle_message(Worker,?REQ, ?WORK_COMPLETE, Data) ->
-    io:format("==> worker: ~p WORK_COMPLETE~n", [Worker]),
+    ?DEBUG("==> worker: ~p WORK_COMPLETE~n", [Worker]),
     %% FIXME should use binary:split here, but not available in my 
     %% erlang version R13B03
     [A|_] = string:tokens(binary_to_list(Data),"\0"),
@@ -148,14 +158,14 @@ handle_message(Worker,?REQ, ?WORK_COMPLETE, Data) ->
     mnesia:transaction(fun() -> mnesia:delete({work,Job#work.id}) end),
 
     if Job#work.client =/= null ->
-            io:format("<== client: ~p WORK_COMPLETE~n", [Job#work.client]),
+            ?DEBUG("<== client: ~p WORK_COMPLETE~n", [Job#work.client]),
             send_response(Job#work.client, ?WORK_COMPLETE, Data);
        true -> noop
     end;
 
 % this ones goes last to alert us something didnt get handled properly
 handle_message(Socket, Req, Type, Data) ->
-    io:format("got unknown message from sock:~p req:~p type:~p data:~p~n", [Socket,Req,Type,Data]).
+    ?DEBUG("got unknown message from sock:~p req:~p type:~p data:~p~n", [Socket,Req,Type,Data]).
 
 send_response(Socket, Type, Data) ->
     Len=byte_size(Data),
@@ -164,14 +174,14 @@ send_response(Socket, Type, Data) ->
 submit_job(Client, RespondTo, Data) ->
     Job = mkjob(RespondTo,Data),
     mnesia:transaction(fun() -> mnesia:write(Job) end),
-    io:format("<== client: ~p JOB_CREATED~n", [Client]),
+    ?DEBUG("<== client: ~p JOB_CREATED~n", [Client]),
     send_response(Client,?JOB_CREATED,Job#work.id),
     spawn( fun() -> wakeup_worker(Job) end ).
 
 wakeup_worker(Job) ->
     Worker = find_worker(Job),
     if Worker =/= null ->
-            io:format("<== worker: ~p NOOP~n", [Worker]),
+            ?DEBUG("<== worker: ~p NOOP~n", [Worker]),
             send_response(Worker,?NOOP,<<>>);
        true -> noop
     end.
@@ -191,13 +201,12 @@ find_work(Worker) ->
     Now = now(),
     Jobs = dbq(qlc:keysort(2,
                            qlc:q([J || J <- mnesia:table(work),
-                                           J#work.assigned =:= null,
+                                       J#work.assigned =:= null,
                                        J#work.schedule =< Now,
                                        F <- mnesia:table(function),
                                        F#function.sock =:= Worker,
                                        J#work.name =:= F#function.name
                                  ]))),
-    [ io:format("available work: ~p~n", [J]) || J <- Jobs ],
     case Jobs of
         [] -> null;
         Jobs -> hd(Jobs)
@@ -206,17 +215,34 @@ find_work(Worker) ->
 mkjob(Client,Data) ->
     %% FIXME should use binary:split here, but not available in my 
     %% erlang version R13B03
+    %% [Function, ID|Work] = binary_split(Data,<<0>>,3),
     [A, B|C] = string:tokens(binary_to_list(Data),"\0"),
     Function = list_to_binary(A),
     ID = list_to_binary(B),
     Work = list_to_binary(C),
     UUID = uuid(),
-    #work{id=UUID,name=Function,data=Work,client_id=ID,client=Client}.
+    Now = now(),
+    #work{id=UUID,ctime=Now,name=Function,data=Work,client_id=ID,client=Client,schedule=Now}.
+
+%% binary_split(Binary,Tok,Limit) ->
+%%     binary_split1(1,Binary,Tok,Limit,0,[]).
+
+%% binary_split1(_Iter,_Binary,_Tok,Limit,Limit,Acc) -> lists:reverse(Acc);
+
+%% binary_split1(Iter,Binary,Tok,Limit,Size,Acc) when byte_size(Binary) > Iter ->
+%%     <<Word:Iter/binary,Cursor:1/binary,Rest/binary>> = Binary,
+%%     if Cursor =:= Tok ->
+%%             binary_split1(1,Rest,Tok,Limit,Size+1,[Word|Acc]);
+%%        true ->
+%%             binary_split1(Iter+1,Binary,Tok,Limit,Size,Acc)
+%%     end;
+
+%% binary_split1(_Iter,_Binary,_Tok,_Limit,_Size,Acc) -> lists:reverse(Acc).
 
 report_status(Socket)->
-    dbq(qlc:q([ io:format("report worker: ~p~n", [X]) || X <- mnesia:table(worker) ])),
-    dbq(qlc:q([ io:format("report function: ~p~n", [X]) || X <- mnesia:table(function) ])),
-    dbq(qlc:q([ io:format("report work: ~p~n", [X]) || X <- mnesia:table(work) ])),
+    dbq(qlc:q([ ?DEBUG("report worker: ~p~n", [X]) || X <- mnesia:table(worker) ])),
+    dbq(qlc:q([ ?DEBUG("report function: ~p~n", [X]) || X <- mnesia:table(function) ])),
+    dbq(qlc:q([ ?DEBUG("report work: ~p~n", [X]) || X <- mnesia:table(work) ])),
     gen_tcp:send(Socket,<<"TODO\n">>).
 
 uuid() ->
