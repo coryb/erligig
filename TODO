@@ -1,8 +1,6 @@
 * create mutex for socket so multiple processes to not write
   to the same socket at the same time
   - can we verify this is a legit concern?
-* update work in queue to have assigned worker
-  so that we do not double-dispatch jobs
 * persist work table 
   - use getopt to enable/disable?
 * delete sync jobs on start (client =/= null)
