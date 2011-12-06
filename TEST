@@ -1,0 +1,5 @@
+* start worker
+gearman -p 8888 -w -f test wc
+
+* run worker
+gearman -p 8888 -f test "this is a test"
