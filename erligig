@@ -76,10 +76,7 @@ handle(Socket) ->
                       [mnesia:write(X) || X <- Jobs],
                       %% if jobs found, then kick some other worker to handle the workload
                       %% that this one just abandoned
-                      case Jobs of
-                          [] -> ok;
-                          Jobs -> wakeup_worker(hd(Jobs))
-                      end
+                      [wakeup_worker(Job) || Job <- Jobs]
               end
              );
         UnhandledMessage -> io:format("unhandled message: ~p~n", [UnhandledMessage])
@@ -154,8 +151,8 @@ handle_message(Worker,?REQ, ?WORK_COMPLETE, Data) ->
     end;
 
 % this ones goes last to alert us something didnt get handled properly
-handle_message(_Socket, Req, Type, Data) ->
-    io:format("got unknown message req:~p type:~p data:~p~n", [Req,Type,Data]).
+handle_message(Socket, Req, Type, Data) ->
+    io:format("got unknown message from sock:~p req:~p type:~p data:~p~n", [Socket,Req,Type,Data]).
 
 send_response(Socket, Type, Data) ->
     Len=byte_size(Data),
