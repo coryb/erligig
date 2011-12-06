@@ -1,8 +1,8 @@
-#!/usr/bin/env escript
 %% -*- mode: erlang -*-
--include_lib("stdlib/include/qlc.hrl").
+-module(erligig).
+-export([start/0]).
 
--mode(compile). %force compilation before executing
+-include_lib("stdlib/include/qlc.hrl").
 
 -define(REQ,<<"\0REQ">>).
 -define(RES,<<"\0RES">>).
@@ -30,7 +30,7 @@
 
 -record(work, {id,ctime,name,data,client_id,client,assigned=null,schedule}).
 
-main(_) ->
+start() ->
     % start up mnesia DB
     ok = application:start(mnesia),
     % create our tables, in memory only on local node
