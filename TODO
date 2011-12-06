@@ -4,8 +4,6 @@
 * persist work table 
   - use getopt to enable/disable?
 * delete sync jobs on start (client =/= null)
-* queue sort ordering?
-  - add timestamp to work queue?
 * single thread work dispatch on client id?
   - use getopt to enable/disable?
 * add job priority support: low|med|high?

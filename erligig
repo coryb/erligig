@@ -26,7 +26,7 @@
 % function record maps the available functions onto the worker sockets
 -record(function, {sock,name}).
 
--record(work, {id,name,data,client_id,client,assigned=null}).
+-record(work, {id,ctime=now(),name,data,client_id,client,assigned=null,schedule=now()}).
 
 main(_) ->
     % start up mnesia DB
@@ -39,7 +39,7 @@ main(_) ->
     {atomic,ok} = mnesia:create_table(work, [{ram_copies,[node()]},{type,bag},{attributes,record_info(fields,work)}]),
 
     % make sure tables are created before we continue
-    ok = mnesia:wait_for_tables([worker,function],infinity),
+    ok = mnesia:wait_for_tables([work,worker,function],infinity),
     
     % bind to our listn port then start acceptint connections
     {ok, ListenSocket} = gen_tcp:listen(8888, [{active,once}, binary, {reuseaddr, true}]),
@@ -49,6 +49,9 @@ main(_) ->
 acceptor(ListenSocket) ->
     {ok, Socket} = gen_tcp:accept(ListenSocket),
     spawn(fun() -> acceptor(ListenSocket) end),
+    %% reset seed for so we can create uniq uuids
+    {X,Y,Z} = now(),
+    random:seed(X,Y,Z),
     handle(Socket).
 
 dbq(QLC)->
@@ -185,11 +188,16 @@ find_worker(Job) ->
     end.
 
 find_work(Worker) ->
-    Jobs = dbq(qlc:q([J || J <- mnesia:table(work),
-                           F <- mnesia:table(function),
-                           J#work.name =:= F#function.name,
-                           F#function.sock =:= Worker,
-                           J#work.assigned =:= null])),
+    Now = now(),
+    Jobs = dbq(qlc:keysort(2,
+                           qlc:q([J || J <- mnesia:table(work),
+                                           J#work.assigned =:= null,
+                                       J#work.schedule =< Now,
+                                       F <- mnesia:table(function),
+                                       F#function.sock =:= Worker,
+                                       J#work.name =:= F#function.name
+                                 ]))),
+    [ io:format("available work: ~p~n", [J]) || J <- Jobs ],
     case Jobs of
         [] -> null;
         Jobs -> hd(Jobs)
@@ -202,7 +210,7 @@ mkjob(Client,Data) ->
     Function = list_to_binary(A),
     ID = list_to_binary(B),
     Work = list_to_binary(C),
-    UUID = list_to_binary(uuid:to_string(uuid:v4())),
+    UUID = uuid(),
     #work{id=UUID,name=Function,data=Work,client_id=ID,client=Client}.
 
 report_status(Socket)->
@@ -210,3 +218,9 @@ report_status(Socket)->
     dbq(qlc:q([ io:format("report function: ~p~n", [X]) || X <- mnesia:table(function) ])),
     dbq(qlc:q([ io:format("report work: ~p~n", [X]) || X <- mnesia:table(work) ])),
     gen_tcp:send(Socket,<<"TODO\n">>).
+
+uuid() ->
+    %% FIXME this is pseudo random, find alternate solution
+    [R1,R2,R3,R4] = [ random:uniform(16#FFFFFFFF) || _ <- [1,2,3,4] ],
+    <<A:32, B:16, C:16, D:16, E:48>> = <<R1:32,R2:32,R3:32,R4:32>>,
+    list_to_binary(io_lib:format("~8.16.0b-~4.16.0b-~4.16.0b-~4.16.0b-~12.16.0b",[A,B,C,D,E])).
