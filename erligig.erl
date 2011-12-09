@@ -2,7 +2,7 @@
 -module(erligig).
 -export([start/0]).
 
--include_lib("stdlib/include/qlc.hrl").
+-include("records.hrl").
 
 -define(REQ,<<"\0REQ">>).
 -define(RES,<<"\0RES">>).
@@ -22,32 +22,15 @@
 -define(DEBUG(Format,Args),logger ! ["DEBUG",?FILE,?LINE,Format,Args]).
 %-define(DEBUG(Format,Args),ok).
 
-% create record types for out DB's
-%---------------------------------
-% worker record just marks if a worker socket is busy
--record(worker, {sock,state=ready}).
-% function record maps the available functions onto the worker sockets
--record(function, {sock,name}).
-
--record(work, {id,ctime,name,data,client_id,client,assigned=null,schedule}).
 
 start() ->
     ok = application:start(crypto),
-    % start up mnesia DB
-    ok = application:start(mnesia),
-    % create our tables, in memory only on local node
-    {atomic,ok} = mnesia:create_table(worker, [{ram_copies,[node()]},{type,set},{attributes,record_info(fields,worker)}]),
-    {atomic,ok} = mnesia:create_table(function, [{ram_copies,[node()]},{type,bag},{attributes,record_info(fields,function)}]),
-
-    % create our memory + disk tables:
-    {atomic,ok} = mnesia:create_table(work, [{ram_copies,[node()]},{type,bag},{attributes,record_info(fields,work)}]),
-
-    % make sure tables are created before we continue
-    ok = mnesia:wait_for_tables([work,worker,function],infinity),
+    register(randproc,spawn(fun() -> rand_loop(crypto:rand_bytes(8092),0) end)),
 
     register(logger, spawn(fun() -> logger_loop() end)),
-    register(randproc,spawn(fun() -> rand_loop(crypto:rand_bytes(8092),0) end)),
     register(wakeup, spawn(fun() -> wakeup_loop() end)), 
+
+    erligig_db:start(),
 
     % bind to our listn port then start acceptint connections
     {ok, ListenSocket} = gen_tcp:listen(8888, [{active,false}, binary, {reuseaddr, true}]),
@@ -56,10 +39,7 @@ start() ->
 
 rand(Len) ->
     randproc ! {self(),Len},
-    receive
-        {ok,Data} ->
-            Data
-    end.
+    receive {ok,Data} -> Data end.
 
 rand_loop(Data,Offset) ->
     receive
@@ -88,10 +68,6 @@ acceptor(ListenSocket) ->
     %fprof:trace(start),
     handle(Socket).
 
-dbq(QLC)->
-    {atomic, Result} = mnesia:transaction(fun() -> qlc:e(QLC) end),
-    Result.
-
 handle(Socket) ->
     case gen_tcp:recv(Socket,0) of
         {ok, <<"status\r\n">>} ->
@@ -108,20 +84,8 @@ handle(Socket) ->
             handle(Socket);
         {error, closed} ->
             %fprof:trace(stop),
-            mnesia:transaction(
-              fun() -> 
-                      dbq(qlc:q([mnesia:delete({function, X#function.sock}) || X <- mnesia:table(function), X#function.sock =:= Socket])),
-                      dbq(qlc:q([mnesia:delete({worker, X#worker.sock})     || X <- mnesia:table(worker),   X#worker.sock =:= Socket])),
-                      
-                      %% if it died while work was still running on it, then update the queue so it can be issued out again    
-                      Jobs = dbq(qlc:q([X#work{assigned=null} || X <- mnesia:table(work),   X#work.assigned =:= Socket])),
-                      [mnesia:write(X) || X <- Jobs],
-                      %% if jobs found, then kick some other worker to handle the workload
-                      %% that this one just abandoned
-                      [wakeup_worker(Job) || Job <- Jobs]
-              end
-             ),
-            ok;
+            Jobs = erlang_db:worker_gone(Socket),
+            [wakeup_worker(Job) || Job <- Jobs];
         UnhandledMessage ->
             ?DEBUG("unhandled message: ~p~n", [UnhandledMessage]),
             handle(Socket)
@@ -130,13 +94,11 @@ handle(Socket) ->
 handle_message(Worker,?REQ, ?CAN_DO, Data)->
     ?DEBUG("==> worker register: ~p~n",[Data]),
     % load out new worker into the DB
-    WorkerRec = #worker{sock=Worker},
-    FuncRec = #function{name=Data,sock=Worker},
-    mnesia:transaction(fun() -> mnesia:write(WorkerRec), mnesia:write(FuncRec) end);
+    erlang_db:worker_register(Worker,Data);
 
 handle_message(Worker,?REQ,?CANT_DO,Data) ->
     ?DEBUG("==> worker unregister: ~p~n",[Data]),
-    mnesia:transaction(fun() -> mnesia:delete({function,Worker}) end);
+    erlang_db:worker_unregister(Worker);
 
 % this is a SYNC job, it will not be inserted into the queue
 handle_message(Client, ?REQ, ?SUBMIT_JOB, Data)->
@@ -149,19 +111,12 @@ handle_message(Client, ?REQ, ?SUBMIT_JOB_BG, Data) ->
 
 handle_message(Worker,?REQ, ?GRAB_JOB,_Data)->
     ?DEBUG("==> worker: ~p GRAB_JOB~n", [Worker]),
-    Work = find_work(Worker),
+    Work = erlang_db:assign_work(Worker),
     if Work =:= null ->       
             ?DEBUG("<== worker: ~p NO_JOB~n", [Worker]),
             send_response(Worker,?NO_JOB,<<>>);
        true ->
             Workload = list_to_binary([Work#work.id,0,Work#work.name,0,Work#work.data]),
-
-            % update our state to mark the worker busy so we dont send it more work
-            WorkerRec = #worker{sock=Worker,state=busy},
-            % also update our job queue so we dont reassign the job to someone else
-            WorkRec = Work#work{assigned=Worker},
-            mnesia:transaction(fun() -> mnesia:write(WorkerRec), mnesia:write(WorkRec) end),
-
             ?DEBUG("<== worker: ~p JOB_ASSIGN~n", [Worker]),
             send_response(Worker, ?JOB_ASSIGN, Workload)
     end;
@@ -180,19 +135,11 @@ handle_message(Worker,?REQ, ?WORK_COMPLETE, Data) ->
     [A|_] = string:tokens(binary_to_list(Data),"\0"),
     ID = list_to_binary(A),
 
-    % the worker is available to do work again
-    WorkerRec = #worker{sock=Worker,state=ready},
-    mnesia:transaction(fun() -> mnesia:write(WorkerRec) end),
-
-    % find the job just completed
-    [Job|_] = dbq(qlc:q([J || J <- mnesia:table(work),
-                              J#work.id =:= ID])),
-    mnesia:transaction(fun() -> mnesia:delete({work,Job#work.id}) end),
-
-    if Job#work.client =/= null ->
-            ?DEBUG("<== client: ~p WORK_COMPLETE~n", [Job#work.client]),
-            send_response(Job#work.client, ?WORK_COMPLETE, Data);
-       true -> noop
+    case erligig_db:work_done(Worker,ID) of
+        null -> ok;
+        Client -> 
+            ?DEBUG("<== client: ~p WORK_COMPLETE~n", []),
+            send_response(Client, ?WORK_COMPLETE, Data)
     end;
 
 % this ones goes last to alert us something didnt get handled properly
@@ -205,7 +152,8 @@ send_response(Socket, Type, Data) ->
 
 submit_job(Client, RespondTo, Data) ->
     Job = mkjob(RespondTo,Data),
-    mnesia:transaction(fun() -> mnesia:write(Job) end),
+    erligig_db:add_work(Job),
+
     ?DEBUG("<== client: ~p JOB_CREATED~n", [Client]),
     send_response(Client,?JOB_CREATED,Job#work.id),
     wakeup_worker(Job).
@@ -214,7 +162,7 @@ wakeup_loop() ->
     receive
         {Pid,Job} ->
             Pid ! ok,
-            Worker = find_worker(Job),
+            Worker = erligig_db:available_worker(Job),
             case Worker of
                 null -> wakeup_loop();
                 _ ->
@@ -227,32 +175,6 @@ wakeup_loop() ->
 wakeup_worker(Job) ->
     wakeup ! {self(),Job}.
     
-find_worker(Job) ->
-    Workers = dbq(qlc:q([W#worker.sock || W <- mnesia:table(worker),
-                                          W#worker.state =:= ready,
-                                          F <- mnesia:table(function),
-                                          W#worker.sock =:= F#function.sock,
-                                          F#function.name =:= Job#work.name ])),
-    case Workers of
-        [] -> null;
-        Workers -> hd(Workers)
-    end.
-
-find_work(Worker) ->
-    Now = now(),
-    Jobs = dbq(qlc:keysort(2,
-                           qlc:q([J || J <- mnesia:table(work),
-                                       J#work.assigned =:= null,
-                                       J#work.schedule =< Now,
-                                       F <- mnesia:table(function),
-                                       F#function.sock =:= Worker,
-                                       J#work.name =:= F#function.name
-                                 ]))),
-    case Jobs of
-        [] -> null;
-        Jobs -> hd(Jobs)
-    end.
-
 findDelimiters(Bin,Delim,Lim) ->
     findDelimiters(Bin,Delim,Lim,1,[]).
 
@@ -275,9 +197,9 @@ mkjob(Client,Data) ->
     #work{id=uuid(),ctime=Now,name=Function,data=Work,client_id=ID,client=Client,schedule=Now}.
 
 report_status(Socket)->
-    dbq(qlc:q([ ?DEBUG("report worker: ~p~n", [X]) || X <- mnesia:table(worker) ])),
-    dbq(qlc:q([ ?DEBUG("report function: ~p~n", [X]) || X <- mnesia:table(function) ])),
-    dbq(qlc:q([ ?DEBUG("report work: ~p~n", [X]) || X <- mnesia:table(work) ])),
+    [ ?DEBUG("report worker: ~p~n", [X]) || X <- erligig_db:all_workers() ],
+    [ ?DEBUG("report function: ~p~n", [X]) || X <- erligig_db:all_functions() ],
+    [ ?DEBUG("report work: ~p~n", [X]) || X <- erligig_db:all_work() ],
     gen_tcp:send(Socket,<<"TODO\n">>).
 
 tohex(C) when C < 10 -> C + 48;
@@ -297,14 +219,3 @@ uuid() ->
        tohex(E1),tohex(E2),tohex(E3),tohex(E4),tohex(E5),tohex(E6),
        tohex(E7),tohex(E8),tohex(E9),tohex(E10),tohex(E11),tohex(E12)
       ]).
-
-
-
-
-
-
-
-
-
-
-
