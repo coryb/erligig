@@ -20,6 +20,7 @@
 -define(SUBMIT_JOB_BG,18).
 
 -define(DEBUG(Format,Args),logger ! ["DEBUG",?FILE,?LINE,Format,Args]).
+%-define(DEBUG(Format,Args),ok).
 
 % create record types for out DB's
 %---------------------------------
@@ -31,6 +32,7 @@
 -record(work, {id,ctime,name,data,client_id,client,assigned=null,schedule}).
 
 start() ->
+    ok = application:start(crypto),
     % start up mnesia DB
     ok = application:start(mnesia),
     % create our tables, in memory only on local node
@@ -42,12 +44,35 @@ start() ->
 
     % make sure tables are created before we continue
     ok = mnesia:wait_for_tables([work,worker,function],infinity),
-    
-    % bind to our listn port then start acceptint connections
-    {ok, ListenSocket} = gen_tcp:listen(8888, [{active,once}, binary, {reuseaddr, true}]),
-    spawn(fun() -> acceptor(ListenSocket) end),
+
     register(logger, spawn(fun() -> logger_loop() end)),
+    register(randproc,spawn(fun() -> rand_loop(crypto:rand_bytes(8092),0) end)),
+    register(wakeup, spawn(fun() -> wakeup_loop() end)), 
+
+    % bind to our listn port then start acceptint connections
+    {ok, ListenSocket} = gen_tcp:listen(8888, [{active,false}, binary, {reuseaddr, true}]),
+    spawn(fun() -> acceptor(ListenSocket) end),
     timer:sleep(infinity).
+
+rand(Len) ->
+    randproc ! {self(),Len},
+    receive
+        {ok,Data} ->
+            Data
+    end.
+
+rand_loop(Data,Offset) ->
+    receive
+        {Pid,Len} ->
+            if Len > 8092 - Offset -> 
+                    Pid ! {ok,crypto:rand_bytes(Len)},
+                    rand_loop(crypto:rand_bytes(8092),0);
+               true ->
+                    <<_:Offset/binary,Bytes:Len/binary,_/binary>> = Data,
+                    Pid ! {ok, Bytes},
+                    rand_loop(Data,Offset + Len)
+            end
+    end.
 
 logger_loop() ->
     receive
@@ -60,8 +85,7 @@ acceptor(ListenSocket) ->
     {ok, Socket} = gen_tcp:accept(ListenSocket),
     spawn(fun() -> acceptor(ListenSocket) end),
     %% reset seed for so we can create uniq uuids
-    {X,Y,Z} = now(),
-    random:seed(X,Y,Z),
+    %fprof:trace(start),
     handle(Socket).
 
 dbq(QLC)->
@@ -69,16 +93,21 @@ dbq(QLC)->
     Result.
 
 handle(Socket) ->
-    inet:setopts(Socket, [{active, once}]),
-    receive
-        {tcp, Socket, <<"status\r\n">>} ->
+    case gen_tcp:recv(Socket,0) of
+        {ok, <<"status\r\n">>} ->
             report_status(Socket);
-        {tcp, Socket, Message} ->
+        {ok, <<"\0REQ", T:32, L:32, D:L/binary>>} ->
             % we might get several seperate protocol requests in one Message, so use binary comprehension to
             % split them up and call handle_message for each
-            [ handle_message(Socket, Req, Type, Data) || <<Req:4/binary, Type:32, Length:32, Data:Length/binary>> <= Message ],
+            handle_message(Socket,?REQ,T,D),
             handle(Socket);
-        {tcp_closed, Socket} ->
+        {ok, Wha} ->
+            [ handle_message(Socket,?REQ,T,D) || <<"\0REQ", T:32, L:32, D:L/binary>> <= Wha ],
+            handle(Socket);
+        {error, timeout} -> 
+            handle(Socket);
+        {error, closed} ->
+            %fprof:trace(stop),
             mnesia:transaction(
               fun() -> 
                       dbq(qlc:q([mnesia:delete({function, X#function.sock}) || X <- mnesia:table(function), X#function.sock =:= Socket])),
@@ -91,8 +120,11 @@ handle(Socket) ->
                       %% that this one just abandoned
                       [wakeup_worker(Job) || Job <- Jobs]
               end
-             );
-        UnhandledMessage -> ?DEBUG("unhandled message: ~p~n", [UnhandledMessage])
+             ),
+            ok;
+        UnhandledMessage ->
+            ?DEBUG("unhandled message: ~p~n", [UnhandledMessage]),
+            handle(Socket)
     end.
 
 handle_message(Worker,?REQ, ?CAN_DO, Data)->
@@ -176,15 +208,24 @@ submit_job(Client, RespondTo, Data) ->
     mnesia:transaction(fun() -> mnesia:write(Job) end),
     ?DEBUG("<== client: ~p JOB_CREATED~n", [Client]),
     send_response(Client,?JOB_CREATED,Job#work.id),
-    spawn( fun() -> wakeup_worker(Job) end ).
+    wakeup_worker(Job).
+
+wakeup_loop() ->
+    receive
+        {Pid,Job} ->
+            Pid ! ok,
+            Worker = find_worker(Job),
+            case Worker of
+                null -> wakeup_loop();
+                _ ->
+                    ?DEBUG("<== worker: ~p NOOP~n", [Worker]),
+                    send_response(Worker,?NOOP,<<>>),
+                    wakeup_loop()
+            end
+    end.
 
 wakeup_worker(Job) ->
-    Worker = find_worker(Job),
-    if Worker =/= null ->
-            ?DEBUG("<== worker: ~p NOOP~n", [Worker]),
-            send_response(Worker,?NOOP,<<>>);
-       true -> noop
-    end.
+    wakeup ! {self(),Job}.
     
 find_worker(Job) ->
     Workers = dbq(qlc:q([W#worker.sock || W <- mnesia:table(worker),
@@ -212,32 +253,26 @@ find_work(Worker) ->
         Jobs -> hd(Jobs)
     end.
 
+findDelimiters(Bin,Delim,Lim) ->
+    findDelimiters(Bin,Delim,Lim,1,[]).
+
+findDelimiters(_Bin,_Delim,Lim,_Offset,Acc) when length(Acc) =:= Lim ->
+    lists:reverse(Acc);
+
+findDelimiters(Bin,Delim,Lim,Offset,Acc) ->
+    <<_:Offset/binary,NewDelim:1/binary,_/binary>> = Bin,
+    Prev = case Acc of [] -> 0; _ -> hd(Acc) + 1  end,
+    if NewDelim =:= Delim ->
+            findDelimiters(Bin,Delim,Lim,Offset+1,[Offset-Prev|Acc]);
+       true ->
+            findDelimiters(Bin,Delim,Lim,Offset+1,Acc)
+    end.
+
 mkjob(Client,Data) ->
-    %% FIXME should use binary:split here, but not available in my 
-    %% erlang version R13B03
-    %% [Function, ID|Work] = binary_split(Data,<<0>>,3),
-    [A, B|C] = string:tokens(binary_to_list(Data),"\0"),
-    Function = list_to_binary(A),
-    ID = list_to_binary(B),
-    Work = list_to_binary(C),
-    UUID = uuid(),
+    [L1,L2] = findDelimiters(Data,<<0>>,2),
+    <<Function:L1/binary,_:1/binary,ID:L2/binary,_:1/binary,Work/binary>> = Data,
     Now = now(),
-    #work{id=UUID,ctime=Now,name=Function,data=Work,client_id=ID,client=Client,schedule=Now}.
-
-%% binary_split(Binary,Tok,Limit) ->
-%%     binary_split1(1,Binary,Tok,Limit,0,[]).
-
-%% binary_split1(_Iter,_Binary,_Tok,Limit,Limit,Acc) -> lists:reverse(Acc);
-
-%% binary_split1(Iter,Binary,Tok,Limit,Size,Acc) when byte_size(Binary) > Iter ->
-%%     <<Word:Iter/binary,Cursor:1/binary,Rest/binary>> = Binary,
-%%     if Cursor =:= Tok ->
-%%             binary_split1(1,Rest,Tok,Limit,Size+1,[Word|Acc]);
-%%        true ->
-%%             binary_split1(Iter+1,Binary,Tok,Limit,Size,Acc)
-%%     end;
-
-%% binary_split1(_Iter,_Binary,_Tok,_Limit,_Size,Acc) -> lists:reverse(Acc).
+    #work{id=uuid(),ctime=Now,name=Function,data=Work,client_id=ID,client=Client,schedule=Now}.
 
 report_status(Socket)->
     dbq(qlc:q([ ?DEBUG("report worker: ~p~n", [X]) || X <- mnesia:table(worker) ])),
@@ -245,8 +280,31 @@ report_status(Socket)->
     dbq(qlc:q([ ?DEBUG("report work: ~p~n", [X]) || X <- mnesia:table(work) ])),
     gen_tcp:send(Socket,<<"TODO\n">>).
 
+tohex(C) when C < 10 -> C + 48;
+tohex(C) -> C + 131.
+    
 uuid() ->
-    %% FIXME this is pseudo random, find alternate solution
-    [R1,R2,R3,R4] = [ random:uniform(16#FFFFFFFF) || _ <- [1,2,3,4] ],
-    <<A:32, B:16, C:16, D:16, E:48>> = <<R1:32,R2:32,R3:32,R4:32>>,
-    list_to_binary(io_lib:format("~8.16.0b-~4.16.0b-~4.16.0b-~4.16.0b-~12.16.0b",[A,B,C,D,E])).
+    <<A1:4,A2:4,A3:4,A4:4,A5:4,A6:4,A7:4,A8:4,
+      B1:4,B2:4,B3:4,B4:4,
+      C1:4,C2:4,C3:4,C4:4,
+      D1:4,D2:4,D3:4,D4:4,
+      E1:4,E2:4,E3:4,E4:4,E5:4,E6:4,E7:4,E8:4,E9:4,E10:4,E11:4,E12:4>> = rand(16),
+    erlang:list_to_binary([
+       tohex(A1),tohex(A2),tohex(A3),tohex(A4),tohex(A5),tohex(A6),tohex(A7),tohex(A8),"-",
+       tohex(B1),tohex(B2),tohex(B3),tohex(B4),"-",
+       tohex(C1),tohex(C2),tohex(C3),tohex(C4),"-",
+       tohex(D1),tohex(D2),tohex(D3),tohex(D4),"-",
+       tohex(E1),tohex(E2),tohex(E3),tohex(E4),tohex(E5),tohex(E6),
+       tohex(E7),tohex(E8),tohex(E9),tohex(E10),tohex(E11),tohex(E12)
+      ]).
+
+
+
+
+
+
+
+
+
+
+

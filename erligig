@@ -3,4 +3,4 @@
 ERL_START_OPTIONS=-noshell
 ERL="/usr/bin/env erl"
 
-$ERL $ERL_START_OPTIONS -s erligig
+$ERL $ERL_START_OPTIONS +K true -smp true +A 10 -s erligig

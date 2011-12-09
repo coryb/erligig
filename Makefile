@@ -1,12 +1,15 @@
 .SUFFIXES: .erl .beam
 .erl.beam:
-	erlc -W $<
+	erlc +native -W $<
 
 MODS = $(wildcard *.erl)
 
 all: compile
 
 compile: $(patsubst %.erl,%.beam,$(MODS))
+
+run: compile
+	./erligig
 
 clean:
 	rm -rf *.beam
