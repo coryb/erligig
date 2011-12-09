@@ -27,14 +27,25 @@ dbq(QLC)->
     {atomic, Result} = mnesia:transaction(fun() -> qlc:e(QLC) end),
     Result.
 
+dbc(QH,Count)->
+    Wtf = mnesia:transaction(
+                         fun() -> 
+                                 QC = qlc:cursor(QH),
+                                 Result = qlc:next_answers(QC,Count),
+                                 qlc:delete_cursor(QC),
+                                 Result
+                         end),
+    {atomic, Result} = Wtf,
+    Result.
+
 worker_gone(Worker) ->
     {atomic, Results} = mnesia:transaction(
       fun() -> 
-              dbq(qlc:q([mnesia:delete({function, X#function.sock}) || X <- mnesia:table(function), X#function.sock =:= Worker])),
-              dbq(qlc:q([mnesia:delete({worker, X#worker.sock})     || X <- mnesia:table(worker),   X#worker.sock =:= Worker])),
+              qlc:e(qlc:q([mnesia:delete({function, X#function.sock}) || X <- mnesia:table(function), X#function.sock =:= Worker])),
+              qlc:e(qlc:q([mnesia:delete({worker, X#worker.sock})     || X <- mnesia:table(worker),   X#worker.sock =:= Worker])),
               
               %% if it died while work was still running on it, then update the queue so it can be issued out again    
-              Jobs = dbq(qlc:q([X#work{assigned=null} || X <- mnesia:table(work),   X#work.assigned =:= Worker])),
+              Jobs = qlc:e(qlc:q([X#work{assigned=null} || X <- mnesia:table(work),   X#work.assigned =:= Worker])),
               [mnesia:write(X) || X <- Jobs],
               %% if jobs found, then kick some other worker to handle the workload
               %% that this one just abandoned
@@ -53,18 +64,17 @@ worker_unregister(Worker) ->
 
 assign_work(Worker) ->
     Now = now(),
-    Jobs = dbq(qlc:keysort(2,
-                           qlc:q([J || J <- mnesia:table(work),
-                                       J#work.assigned =:= null,
-                                       J#work.schedule =< Now,
-                                       F <- mnesia:table(function),
-                                       F#function.sock =:= Worker,
-                                       J#work.name =:= F#function.name
-                                 ]))),
-    case Jobs of
+    QH = qlc:keysort(2,
+                     qlc:q([J || J <- mnesia:table(work),
+                                 J#work.assigned =:= null,
+                                 J#work.schedule =< Now,
+                                 F <- mnesia:table(function),
+                                 F#function.sock =:= Worker,
+                                 J#work.name =:= F#function.name
+                           ])),
+    case dbc(QH,1) of
         [] -> null;
-        Jobs ->
-            Work = hd(Jobs),
+        [Work] ->
             %% update our state to mark the worker busy so we dont send it more work
             WorkerRec = #worker{sock=Worker,state=busy},
             %% also update our job queue so we dont reassign the job to someone else
@@ -79,8 +89,9 @@ work_done(Worker,ID) ->
     mnesia:transaction(fun() -> mnesia:write(WorkerRec) end),
     
     %% find the job just completed
-    [Job|_] = dbq(qlc:q([J || J <- mnesia:table(work),
-                              J#work.id =:= ID])),
+    QH = qlc:q([J || J <- mnesia:table(work),
+                              J#work.id =:= ID]),
+    [Job] = dbc(QH,1),
     mnesia:transaction(fun() -> mnesia:delete({work,Job#work.id}) end),
     Job#work.client.
 
@@ -88,14 +99,14 @@ add_work(Work) ->
     mnesia:transaction(fun() -> mnesia:write(Work) end).
 
 available_worker(Work) ->
-    Workers = dbq(qlc:q([W#worker.sock || W <- mnesia:table(worker),
-                                          W#worker.state =:= ready,
-                                          F <- mnesia:table(function),
-                                          W#worker.sock =:= F#function.sock,
-                                          F#function.name =:= Work#work.name ])),
-    case Workers of
+    QH = qlc:q([W#worker.sock || W <- mnesia:table(worker),
+                                 W#worker.state =:= ready,
+                                 F <- mnesia:table(function),
+                                 W#worker.sock =:= F#function.sock,
+                                 F#function.name =:= Work#work.name ]),
+    case dbc(QH,1) of
         [] -> null;
-        Workers -> hd(Workers)
+        [Worker] -> Worker#worker.sock
     end.
 
 all_workers() ->

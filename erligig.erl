@@ -84,7 +84,7 @@ handle(Socket) ->
             handle(Socket);
         {error, closed} ->
             %fprof:trace(stop),
-            Jobs = erlang_db:worker_gone(Socket),
+            Jobs = erligig_db:worker_gone(Socket),
             [wakeup_worker(Job) || Job <- Jobs];
         UnhandledMessage ->
             ?DEBUG("unhandled message: ~p~n", [UnhandledMessage]),
@@ -94,11 +94,11 @@ handle(Socket) ->
 handle_message(Worker,?REQ, ?CAN_DO, Data)->
     ?DEBUG("==> worker register: ~p~n",[Data]),
     % load out new worker into the DB
-    erlang_db:worker_register(Worker,Data);
+    erligig_db:worker_register(Worker,Data);
 
 handle_message(Worker,?REQ,?CANT_DO,Data) ->
     ?DEBUG("==> worker unregister: ~p~n",[Data]),
-    erlang_db:worker_unregister(Worker);
+    erligig_db:worker_unregister(Worker);
 
 % this is a SYNC job, it will not be inserted into the queue
 handle_message(Client, ?REQ, ?SUBMIT_JOB, Data)->
@@ -111,7 +111,7 @@ handle_message(Client, ?REQ, ?SUBMIT_JOB_BG, Data) ->
 
 handle_message(Worker,?REQ, ?GRAB_JOB,_Data)->
     ?DEBUG("==> worker: ~p GRAB_JOB~n", [Worker]),
-    Work = erlang_db:assign_work(Worker),
+    Work = erligig_db:assign_work(Worker),
     if Work =:= null ->       
             ?DEBUG("<== worker: ~p NO_JOB~n", [Worker]),
             send_response(Worker,?NO_JOB,<<>>);
