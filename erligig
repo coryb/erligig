@@ -1,6 +1,6 @@
 #!/bin/bash
 
-ERL_START_OPTIONS=-noshell
+ERL_START_OPTIONS="-noshell +K true"
 ERL="/usr/bin/env erl"
 
 $ERL $ERL_START_OPTIONS +K true -smp true +A 10 -s erligig
