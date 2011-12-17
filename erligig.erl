@@ -2,26 +2,7 @@
 -module(erligig).
 -export([start/0]).
 
--include("records.hrl").
-
--define(REQ,<<"\0REQ">>).
--define(RES,<<"\0RES">>).
--define(CAN_DO, 1).
--define(CANT_DO,2).
--define(RESET_ABILITIES,3).
--define(PRE_SLEEP,4).
--define(NOOP,6).
--define(SUBMIT_JOB, 7).
--define(JOB_CREATED, 8).  %response from SUBMIT_JOB*
--define(GRAB_JOB,9).
--define(NO_JOB,10). %response from GRAB_JOB on empty queue
--define(JOB_ASSIGN,11). %response from GRAB_JOB with work
--define(WORK_COMPLETE,13).
--define(SUBMIT_JOB_BG,18).
-
--define(DEBUG(Format,Args),logger ! ["DEBUG",?FILE,?LINE,Format,Args]).
-%-define(DEBUG(Format,Args),ok).
-
+-include("erligig.hrl").
 
 start() ->
     ok = application:start(crypto),
@@ -64,7 +45,6 @@ logger_loop() ->
 acceptor(ListenSocket) ->
     {ok, Socket} = gen_tcp:accept(ListenSocket),
     spawn(fun() -> acceptor(ListenSocket) end),
-    %% reset seed for so we can create uniq uuids
     %fprof:trace(start),
     handle(Socket).
 
@@ -72,6 +52,12 @@ handle(Socket) ->
     case gen_tcp:recv(Socket,0) of
         {ok, <<"status\r\n">>} ->
             report_status(Socket);
+        {ok, <<"prof start\r\n">>} ->
+            fprof:trace(start),
+            gen_tcp:send(Socket,<<"Fine\n">>);
+        {ok, <<"prof stop\r\n">>} ->
+            fprof:trace(stop),
+            gen_tcp:send(Socket,<<"Whatevs\n">>);
         {ok, <<"\0REQ", T:32, L:32, D:L/binary>>} ->
             % we might get several seperate protocol requests in one Message, so use binary comprehension to
             % split them up and call handle_message for each
@@ -194,7 +180,7 @@ mkjob(Client,Data) ->
     [L1,L2] = findDelimiters(Data,<<0>>,2),
     <<Function:L1/binary,_:1/binary,ID:L2/binary,_:1/binary,Work/binary>> = Data,
     Now = now(),
-    #work{id=uuid(),ctime=Now,name=Function,data=Work,client_id=ID,client=Client,schedule=Now}.
+    #work{schedule=Now,id=uuid(),ctime=Now,name=Function,data=Work,client_id=ID,client=Client}.
 
 report_status(Socket)->
     [ ?DEBUG("report worker: ~p~n", [X]) || X <- erligig_db:all_workers() ],

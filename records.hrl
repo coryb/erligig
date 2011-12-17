@@ -1,3 +1,0 @@
--record(worker, {sock,state=ready}).
--record(function, {sock,name}).
--record(work, {id,ctime,name,data,client_id,client,assigned=null,schedule}).

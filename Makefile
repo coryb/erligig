@@ -3,10 +3,13 @@
 	erlc +native -W $<
 
 MODS = $(wildcard *.erl)
+BEAMS = $(patsubst %.erl,%.beam,$(MODS))
 
 all: compile
 
-compile: $(patsubst %.erl,%.beam,$(MODS))
+compile: $(BEAMS)
+
+$(BEAMS): $(wildcard *.hrl)
 
 run: compile
 	./erligig
