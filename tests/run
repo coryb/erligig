@@ -1,0 +1,11 @@
+#!/bin/bash
+port=$1
+
+[ -z "$port" ] && port=8888
+seq 1 1000 >./count
+echo
+echo "Loading Jobs"
+time gearman -p $port -n -b -f test <./count
+echo
+echo "Running Jobs"
+time gearman -p $port -w -c 1000 -f test catlog ./count.log
