@@ -147,7 +147,7 @@ available_worker(Work) ->
                                  F#function.name =:= Work#work.name ]),
     case dbc(QH,1) of
         [] -> null;
-        [Worker] -> Worker#worker.sock
+        [Worker] -> Worker
     end.
 
 all_workers() ->
